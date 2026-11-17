@@ -10,6 +10,7 @@ import com.metrolist.innertubex.extraction.strategy.ClientHealthScope
 import com.metrolist.innertubex.extraction.strategy.ClientSelectionRequest
 import com.metrolist.innertubex.extraction.strategy.ClientSelectionResult
 import com.metrolist.innertubex.extraction.strategy.ContentAwareFallbackStrategy
+import com.metrolist.innertubex.extraction.strategy.InMemoryClientHealthMonitor
 import com.metrolist.innertubex.extraction.strategy.PlaybackClientCatalog
 import com.metrolist.innertubex.extraction.strategy.PlaybackTransportPreference
 import com.metrolist.innertubex.extraction.strategy.PoTokenProviderKind
@@ -28,16 +29,139 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.Json
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 import kotlin.time.Clock
 import kotlin.time.Duration.Companion.hours
 
 class PlayerClientDirectorTest {
+    @Test
+    fun remixSabrAudioPrecedesWebForNormalAndExplicitTracks() {
+        for (explicit in listOf(false, true)) {
+            val selection =
+                ContentAwareFallbackStrategy()
+                    .selectClients(
+                        ClientSelectionRequest(
+                            hints = ContentHints(isExplicit = explicit, sabrFirst = true),
+                            authenticated = true,
+                            availablePoTokenProviders = PoTokenProviderKind.entries.toSet(),
+                            webViewAvailable = true,
+                            transportPreference = PlaybackTransportPreference.SABR,
+                        ),
+                    ).candidates
+                    .map { it.manifest?.id }
+            assertTrue(selection.indexOf("WEB_REMIX_SABR") >= 0)
+            assertTrue(selection.indexOf("WEB_REMIX_SABR") < selection.indexOf("WEB_SABR"), selection.toString())
+        }
+    }
+
+    @Test
+    fun automaticRemixSabrTriesTokenizedThenUntokenizedProfiles() =
+        runBlocking {
+            for (tokenAvailable in listOf(true, false)) {
+                for (excluded in listOf(emptySet(), setOf("WEB_REMIX_SABR__po"))) {
+                    var mints = 0
+                    val client = client { TOKEN_PLAYER_RESPONSE }
+                    val tube = InnerTube(client, retryDelay = {}).also { it.visitorData = "visitor" }
+                    val tokens =
+                        object : TokenProvider {
+                            override val capabilities = TokenProviderCapabilities(PoTokenProviderKind.entries.toSet(), usesWebView = true)
+
+                            override suspend fun getPoToken(
+                                videoId: String,
+                                visitorData: String,
+                                cookie: String?,
+                            ): PoTokenResult? {
+                                mints++
+                                return if (tokenAvailable) PoTokenResult("", "fixture-gvs", visitorData) else null
+                            }
+                        }
+                    try {
+                        val director =
+                            PlayerClientDirector(tube, fixed(checkNotNull(PlaybackClientCatalog.findManifest("WEB_REMIX_SABR"))), tokens)
+                        val response =
+                            director
+                                .fetchPlayerResponses(
+                                    "video",
+                                    PlayerConfig("player.js", null, null, null),
+                                    ContentHints(),
+                                    excludedClients = excluded,
+                                ).playableResponses
+                                .single()
+                        val expectsToken = tokenAvailable && excluded.isEmpty()
+                        assertEquals(if (expectsToken) "WEB_REMIX_SABR__po" else "WEB_REMIX_SABR__nopo", response.profileId)
+                        assertEquals(if (excluded.isEmpty()) 1 else 0, mints)
+                    } finally {
+                        client.close()
+                    }
+                }
+            }
+        }
+
+    @Test
+    fun forcedGvsOnlyMintOverlapsPlayerAndRejectsInvalidBindings() =
+        runBlocking {
+            for (outcome in listOf("valid", "missing", "wrong-visitor", "empty-gvs")) {
+                val playerStarted = CompletableDeferred<Unit>()
+                val tokenStarted = CompletableDeferred<Unit>()
+                val client =
+                    HttpClient(
+                        MockEngine {
+                            playerStarted.complete(Unit)
+                            tokenStarted.await()
+                            respond(PLAYER_RESPONSE, HttpStatusCode.OK, headersOf(HttpHeaders.ContentType, "application/json"))
+                        },
+                    ) { install(ContentNegotiation) { json(Json { ignoreUnknownKeys = true }) } }
+                val innerTube = InnerTube(client, retryDelay = {}).also { it.visitorData = "visitor" }
+                val provider =
+                    object : TokenProvider {
+                        override val capabilities = TokenProviderCapabilities(setOf(PoTokenProviderKind.WEB_BOTGUARD))
+
+                        override suspend fun getPoToken(
+                            videoId: String,
+                            visitorData: String,
+                            cookie: String?,
+                        ): PoTokenResult? {
+                            tokenStarted.complete(Unit)
+                            playerStarted.await()
+                            return when (outcome) {
+                                "missing" -> null
+                                "wrong-visitor" -> PoTokenResult("", "fixture-gvs", "other-visitor")
+                                "empty-gvs" -> PoTokenResult("fixture-player", "", visitorData)
+                                else -> PoTokenResult("", "fixture-gvs", visitorData)
+                            }
+                        }
+                    }
+                try {
+                    val director =
+                        PlayerClientDirector(innerTube, fixed(checkNotNull(PlaybackClientCatalog.findManifest("WEB_REMIX"))), provider)
+                    val batch =
+                        withTimeout(2_000) {
+                            director.fetchPlayerResponses(
+                                "video",
+                                PlayerConfig("player.js", null, null, null),
+                                ContentHints(playbackClientOverrideId = "WEB_REMIX"),
+                            )
+                        }
+                    if (outcome == "valid") {
+                        assertEquals("fixture-gvs", batch.playableResponses.single().streamingDataPoToken)
+                    } else {
+                        assertTrue(batch.playableResponses.isEmpty())
+                        assertEquals("po_token_unavailable", batch.attempts.single().outcome)
+                    }
+                    assertEquals(1, (client.engine as MockEngine).requestHistory.size)
+                } finally {
+                    client.close()
+                }
+            }
+        }
+
     @Test
     fun disabledAutomaticTransportsDoNotRequestPlayersOrTokens() =
         runBlocking {
@@ -147,6 +271,38 @@ class PlayerClientDirectorTest {
             assertTrue(failures.isEmpty())
             assertEquals("request_budget_exhausted", batch.attempts.single().outcome)
             client.close()
+        }
+
+    @Test
+    fun videoSpecificFailuresDoNotDemoteClientsAcrossVideos() =
+        runBlocking {
+            for (status in listOf("ERROR", "VIDEO_UNAVAILABLE", "LIVE_STREAM_OFFLINE", "UNPLAYABLE")) {
+                var response = """{"playabilityStatus":{"status":"$status"}}"""
+                val client = client { response }
+                try {
+                    val health = InMemoryClientHealthMonitor(nowMs = { 0L })
+                    val manifest = checkNotNull(PlaybackClientCatalog.findManifest("VISIONOS"))
+                    val hints = ContentHints(isLive = status == "LIVE_STREAM_OFFLINE")
+                    val scope = ClientHealthScope.from(hints, authenticated = false)
+                    val director = PlayerClientDirector(InnerTube(client), fixed(manifest), NoTokenProvider, health)
+                    repeat(2) {
+                        val batch = director.fetchPlayerResponses("unavailable-$it", PlayerConfig("player.js", null, null, null), hints)
+                        assertEquals(status, batch.failures.single().status)
+                    }
+                    val adjustment = health.scoreAdjustment(manifest.id, scope)
+                    if (status == "UNPLAYABLE") {
+                        assertTrue(adjustment < -1_000, "client-level failures still start a cooldown")
+                    } else {
+                        assertEquals(0, adjustment, status)
+                    }
+                    response = PLAYER_RESPONSE
+                    val next = director.fetchPlayerResponses("available", PlayerConfig("player.js", null, null, null), hints)
+                    assertEquals(1, next.playableResponses.size)
+                    assertEquals(adjustment, health.scoreAdjustment(manifest.id, scope), "only the host clears media cooldowns")
+                } finally {
+                    client.close()
+                }
+            }
         }
 
     @Test
@@ -337,7 +493,44 @@ class PlayerClientDirectorTest {
         }
 
     @Test
-    fun tokenVisitorChangeCancelsBeforeSendingOldCredentials() =
+    fun incompatibleProviderDoesNotStartAnUnusedOverlappedMint() =
+        runBlocking {
+            var tokenRequests = 0
+            val client = client { TOKEN_PLAYER_RESPONSE }
+            try {
+                val provider =
+                    object : TokenProvider {
+                        override val capabilities = TokenProviderCapabilities(setOf(PoTokenProviderKind.WEB_BOTGUARD))
+
+                        override suspend fun getPoToken(
+                            videoId: String,
+                            visitorData: String,
+                            cookie: String?,
+                        ): PoTokenResult? {
+                            tokenRequests++
+                            return null
+                        }
+                    }
+                val manifest = checkNotNull(PlaybackClientCatalog.findManifest("WEB_SABR"))
+                val innerTube = InnerTube(client).also { it.visitorData = "visitor" }
+                val budget = PlayerRequestBudget(2)
+                val batch =
+                    PlayerClientDirector(innerTube, fixed(manifest), provider)
+                        .fetchPlayerResponses("video", PlayerConfig("player.js", null, null, null), ContentHints(), requestBudget = budget)
+
+                assertEquals(0, tokenRequests)
+                assertEquals(1, budget.remaining)
+                assertTrue(batch.playableResponses.isEmpty())
+                assertTrue(batch.requestFailures.isEmpty())
+                assertEquals("po_token_unavailable", batch.attempts.single().outcome)
+                assertFalse(budget.isTokenUnavailable(PoTokenRequestKey("video", "visitor", null)))
+            } finally {
+                client.close()
+            }
+        }
+
+    @Test
+    fun tokenVisitorChangeCancelsOverlappedRequestBeforeAcceptingResponse() =
         runBlocking {
             var requests = 0
             val client =
@@ -346,7 +539,7 @@ class PlayerClientDirectorTest {
                         requests++
                         respond(PLAYER_RESPONSE, HttpStatusCode.OK, headersOf(HttpHeaders.ContentType, "application/json"))
                     },
-                )
+                ) { install(ContentNegotiation) { json(Json { ignoreUnknownKeys = true }) } }
             val innerTube = InnerTube(client, retryDelay = {}).also { it.visitorData = "old-visitor" }
             val manifest = checkNotNull(PlaybackClientCatalog.findManifest("WEB_REMIX"))
             val provider =
@@ -370,7 +563,7 @@ class PlayerClientDirectorTest {
                     ContentHints(playbackClientOverrideId = "WEB_REMIX"),
                 )
             }
-            assertEquals(0, requests)
+            assertTrue(requests <= 1)
             client.close()
         }
 
@@ -951,7 +1144,7 @@ class PlayerClientDirectorTest {
             """.trimIndent()
         val TOKEN_PLAYER_RESPONSE =
             """
-            {"playabilityStatus":{"status":"OK"},"streamingData":{"serverAbrStreamingUrl":"https://r.googlevideo.com/videoplayback","adaptiveFormats":[{"itag":140,"mimeType":"audio/mp4","bitrate":128000}]},"playerConfig":{"mediaCommonConfig":{"mediaUstreamerRequestConfig":{"videoPlaybackUstreamerConfig":"AQID"}}}}
+            {"playabilityStatus":{"status":"OK"},"videoDetails":{"videoId":"video","lengthSeconds":"180"},"streamingData":{"serverAbrStreamingUrl":"https://r.googlevideo.com/videoplayback","adaptiveFormats":[{"itag":140,"mimeType":"audio/mp4","bitrate":128000,"lastModified":"1700000000000000"},{"itag":160,"mimeType":"video/mp4","bitrate":100000,"width":256,"height":144,"lastModified":"1700000000000000"}]},"playerConfig":{"mediaCommonConfig":{"mediaUstreamerRequestConfig":{"videoPlaybackUstreamerConfig":"AQID"}}}}
             """.trimIndent()
     }
 }

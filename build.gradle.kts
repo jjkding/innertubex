@@ -1,8 +1,9 @@
 @file:Suppress("UnstableApiUsage")
 
+import com.vanniktech.maven.publish.KotlinMultiplatform
+import com.vanniktech.maven.publish.SourcesJar
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 import org.jlleitschuh.gradle.ktlint.KtlintExtension
-import java.util.Base64
 
 plugins {
     alias(libs.plugins.kotlin.multiplatform)
@@ -16,46 +17,6 @@ plugins {
 
 group = providers.gradleProperty("GROUP").get()
 version = providers.gradleProperty("VERSION_NAME").get()
-
-val generateYtEjsNativeScripts =
-    tasks.register("generateYtEjsNativeScripts") {
-        val scripts = layout.projectDirectory.dir("src/commonMain/resources/yt_ejs")
-        val out = layout.buildDirectory.dir("generated/ytEjsNative")
-        inputs.dir(scripts)
-        outputs.dir(out)
-        doLast {
-            val names = listOf("yt.solver.core.min.js", "yt.solver.lib.min.js")
-            val entries =
-                names.joinToString(",\n") { name ->
-                    val b64 = Base64.getEncoder().encodeToString(scripts.file(name).asFile.readBytes())
-                    "        \"$name\" to \"\"\"\n" + b64.chunked(100).joinToString("\n") + "\"\"\".replace(\"\\n\", \"\")"
-                }
-            val dir =
-                out
-                    .get()
-                    .asFile
-                    .resolve("com/metrolist/innertubex/cipher")
-                    .apply { mkdirs() }
-            dir.resolve("YtEjsScriptLoader.native.kt").writeText(
-                listOf(
-                    "package com.metrolist.innertubex.cipher",
-                    "",
-                    "import kotlin.io.encoding.Base64",
-                    "import kotlin.io.encoding.ExperimentalEncodingApi",
-                    "",
-                    "@OptIn(ExperimentalEncodingApi::class)",
-                    "internal actual fun readYtEjsSolverScript(fileName: String): String =",
-                    "    Base64.decode(EMBEDDED[fileName] ?: error(\"Missing embedded script: \$fileName\")).decodeToString()",
-                    "",
-                    "private val EMBEDDED =",
-                    "    mapOf(",
-                    entries,
-                    "    )",
-                    "",
-                ).joinToString("\n"),
-            )
-        }
-    }
 
 kotlin {
     android {
@@ -90,20 +51,18 @@ kotlin {
             api(libs.ktor.client.core)
             api(libs.kotlinx.serialization.json)
             api(libs.kotlinx.coroutines.core)
-            implementation(libs.quickjs)
+            implementation("com.github.MetrolistGroup.quackjs:quackjs:0.1.4")
         }
         commonTest.dependencies {
             implementation(kotlin("test"))
             implementation(libs.ktor.client.mock)
+            implementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:${libs.versions.kotlinxCoroutines.get()}")
             implementation(libs.ktor.client.content.negotiation)
             implementation(libs.ktor.serialization.kotlinx.json)
         }
         val jvmCommonMain = create("jvmCommonMain") { dependsOn(commonMain.get()) }
         androidMain.get().dependsOn(jvmCommonMain)
         getByName("desktopMain").dependsOn(jvmCommonMain)
-        nativeMain {
-            kotlin.srcDir(generateYtEjsNativeScripts)
-        }
         getByName("desktopTest").dependencies {
             implementation(libs.junit4)
         }
@@ -120,17 +79,22 @@ kotlin {
     }
 }
 
+// Kotlin finalizes publication artifacts after evaluating the build scripts.
+gradle.projectsEvaluated {
+    publishing.publications.withType<MavenPublication>().configureEach {
+        if (artifacts.none { it.classifier == "sources" }) {
+            artifact(tasks.named(if (name == "kotlinMultiplatform") "metadataSourcesJar" else "${name}SourcesJar"))
+        }
+        // JitPack strips the metadata classifier from native URLs; retain a matching copy.
+        artifacts.filter { it.classifier == "metadata" }.forEach { metadata ->
+            artifact(metadata.file) { builtBy(metadata.buildDependencies) }
+        }
+    }
+}
+
 apiValidation { ignoredProjects.add("harness") }
 
 tasks.named("allTests") { dependsOn(":harness:test") }
-
-// Host tests run on the build machine's JVM, which cannot load Android's JNI library.
-configurations.named("androidHostTestRuntimeClasspath") {
-    resolutionStrategy.dependencySubstitution {
-        substitute(module("io.github.dokar3:quickjs-kt"))
-            .using(module("io.github.dokar3:quickjs-kt-jvm:${libs.versions.quickjs.get()}"))
-    }
-}
 
 tasks.withType<Test>().configureEach {
     if (name == "testAndroidHostTest") {
@@ -153,6 +117,8 @@ configure<KtlintExtension> {
 }
 
 mavenPublishing {
+    // JitPack drops classifiers from Gradle source-variant URLs; attach the platform JARs separately.
+    configure(KotlinMultiplatform(sourcesJar = SourcesJar.None()))
     pom {
         name.set("InnerTubeX")
         description.set(

@@ -29,8 +29,8 @@ class RemotePlayerConfigParserTest {
 
         val config = result.configs.getValue("16ee6936")
         assertSame(config, result.configs.getValue("ca366632"))
-        assertEquals("mP(4,155,INPUT)", config.sigJsExpression)
-        assertEquals(RemotePlayerConfigParser.buildNJsExpression("Yx"), config.nJsExpression)
+        assertEquals("mP(4,155,INPUT)", config.signatureExpression)
+        assertEquals("Yx", config.nClass)
         assertEquals(20613, config.signatureTimestamp)
     }
 
@@ -52,13 +52,22 @@ class RemotePlayerConfigParserTest {
     }
 
     @Test
-    fun canonicalizesOnlyLocalizedIasPlayerUrls() {
-        assertEquals(
-            "https://www.youtube.com/s/player/66a6ea83/player_ias.vflset/en_GB/base.js",
-            canonicalPlayerUrl("https://www.youtube.com/s/player/66a6ea83/player_ias.vflset/pl_PL/base.js"),
-        )
-        val tvPlayer = "https://www.youtube.com/s/player/66a6ea83/tv-player-ias.vflset/tv-player-ias.js"
-        assertEquals(tvPlayer, canonicalPlayerUrl(tvPlayer))
+    fun canonicalizesEveryVariantOfAPlayerBuild() {
+        val ias = "https://www.youtube.com/s/player/66a6ea83/player_ias.vflset/en_GB/base.js"
+        listOf(
+            "player_ias.vflset/pl_PL/base.js",
+            "player_ias.vflset/es_419/base.js",
+            "player_es6.vflset/en_US/base.js",
+            "player_embed_es6.vflset/en_US/base.js",
+            "player_ias_tce.vflset/en_US/base.js",
+            "tv-player-ias.vflset/tv-player-ias.js",
+        ).forEach { assertEquals(ias, canonicalPlayerUrl("https://www.youtube.com/s/player/66a6ea83/$it")) }
+        for (unknown in listOf(
+            "https://www.youtube.com/s/player/not-a-hash/x.vflset/base.js",
+            "https://www.youtube.com/s/player/66a6ea83/base.js",
+        )) {
+            assertEquals(unknown, canonicalPlayerUrl(unknown))
+        }
     }
 
     @Test

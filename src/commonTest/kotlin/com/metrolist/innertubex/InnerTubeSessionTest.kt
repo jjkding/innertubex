@@ -91,6 +91,32 @@ class InnerTubeSessionTest {
         }
 
     @Test
+    fun invalidFetchedVisitorFallsBackBeforeCaching() =
+        runBlocking {
+            for (homepage in listOf("homepage-visitor", "bad\u0000visitor")) {
+                val engine =
+                    MockEngine { request ->
+                        if (request.url.host == "www.youtube.com") {
+                            respond(serviceWorkerResponse("bad\\u0000visitor"))
+                        } else {
+                            respond("{\"VISITOR_DATA\":\"$homepage\"}")
+                        }
+                    }
+                val client = HttpClient(engine)
+                val innerTube = InnerTube(client)
+                try {
+                    val expected = homepage.takeUnless { it.contains('\u0000') }
+                    assertEquals(expected, innerTube.fetchFreshVisitorData())
+                    assertEquals(expected, innerTube.visitorData)
+                    assertEquals(2, engine.requestHistory.size)
+                } finally {
+                    innerTube.close()
+                    client.close()
+                }
+            }
+        }
+
+    @Test
     fun visitorFetchAfterCloseAndDuringCloseAlwaysCompletes() =
         runBlocking {
             repeat(20) {
@@ -122,7 +148,8 @@ class InnerTubeSessionTest {
                     HttpClient(
                         MockEngine {
                             attempts++
-                            if (attempts == 1) CompletableDeferred<Unit>().await()
+                            // Stall the service worker past its own deadline, then the homepage past the overall one.
+                            if (attempts <= 2) CompletableDeferred<Unit>().await()
                             respond(serviceWorkerResponse("recovered"), HttpStatusCode.OK)
                         },
                     ),
@@ -132,7 +159,7 @@ class InnerTubeSessionTest {
                     assertFailsWith<kotlinx.coroutines.TimeoutCancellationException> { innerTube.fetchFreshVisitorData() }
                     assertEquals("recovered", innerTube.fetchFreshVisitorData())
                 }
-                assertEquals(2, attempts)
+                assertEquals(3, attempts)
             } finally {
                 innerTube.close()
                 innerTube.httpClient.close()
@@ -901,7 +928,7 @@ class InnerTubeSessionTest {
 
                         2 -> {
                             assertEquals("upload-id", request.url.parameters["upload_id"])
-                            respond("{\"encryptedBlobId\":\"blob-id\"}", HttpStatusCode.OK)
+                            respond("{\"encryptedBlobId\":\"blob-id\",\"extra\":true}", HttpStatusCode.OK)
                         }
 
                         else -> {
@@ -998,7 +1025,9 @@ class InnerTubeSessionTest {
         runBlocking {
             val engine = MockEngine { respondOk() }
             val innerTube =
-                clientWithContentNegotiation(engine).also {
+                InnerTube(
+                    HttpClient(engine) { install(ContentNegotiation) { json(kotlinx.serialization.json.Json { encodeDefaults = false }) } },
+                ).also {
                     it.replaceSession(
                         cookie = "SAPISID=account-secret",
                         visitorData = "visitor-data",
@@ -1016,6 +1045,8 @@ class InnerTubeSessionTest {
             assertEquals("1", request.headers["X-Goog-AuthUser"])
             val body = (request.body as io.ktor.http.content.TextContent).text
             assertFalse(body.contains("active-account"))
+            assertTrue(body.contains("\"requestType\":\"ACCOUNTS_LIST_REQUEST_TYPE_CHANNEL_SWITCHER\""))
+            assertTrue(body.contains("\"callCircumstance\":\"SWITCHING_USERS_FULL\""))
         }
 
     @Test

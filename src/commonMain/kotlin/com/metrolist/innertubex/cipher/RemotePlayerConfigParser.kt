@@ -19,16 +19,8 @@ internal object RemotePlayerConfigParser {
         )
 
     data class HardcodedPlayerConfig(
-        val sigFuncName: String,
-        val sigConstantArg: Int?,
-        val sigConstantArgs: List<Int>? = null,
-        val sigPreprocessFunc: String? = null,
-        val sigPreprocessArgs: List<Int>? = null,
-        val sigJsExpression: String? = null,
-        val nFuncName: String,
-        val nArrayIndex: Int?,
-        val nConstantArgs: List<Int>?,
-        val nJsExpression: String? = null,
+        val signatureExpression: String,
+        val nClass: String,
         val signatureTimestamp: Int,
     )
 
@@ -42,10 +34,6 @@ internal object RemotePlayerConfigParser {
             val reason: String,
         ) : ParseResult()
     }
-
-    fun buildNJsExpression(nClass: String): String =
-        "(function(n){try{var u=new g.$nClass('https://x.googlevideo.com/videoplayback?n='+n,true);" +
-            "var t=u.get('n');return(t&&t!==n)?t:n;}catch(e){return n;}})(INPUT)"
 
     fun parse(jsonText: String): ParseResult {
         val root =
@@ -163,13 +151,8 @@ internal object RemotePlayerConfigParser {
 
         val config =
             HardcodedPlayerConfig(
-                sigFuncName = "_expr_sig",
-                sigConstantArg = null,
-                sigJsExpression = sig,
-                nFuncName = "_expr_n",
-                nArrayIndex = null,
-                nConstantArgs = null,
-                nJsExpression = buildNJsExpression(nClass),
+                signatureExpression = sig,
+                nClass = nClass,
                 signatureTimestamp = sts,
             )
         return config to aliases
@@ -181,14 +164,12 @@ internal fun faradayCipherPlayerUrl(playerUrl: String): String? =
         "https://www.youtube.com/s/player/$hash/player_ias.vflset/en_GB/base.js"
     }
 
-private val LOCALIZED_IAS_PLAYER_URL =
-    Regex("^https://www\\.youtube\\.com/s/player/([A-Za-z0-9_-]+)/player_ias\\.vflset/[A-Za-z]{2,3}(?:_[A-Za-z]{2,4})?/base\\.js$")
+private val PLAYER_VARIANT_PATH = Regex("/s/player/[a-f0-9]{8}/[^/]+\\.vflset/")
 
 /**
- * Locale variants of the same `player_ias` build are functionally identical. Mapping them to the variant
- * the remote configs are validated against lets every cipher path share one download and cache entry.
+ * Every script variant of one player build (locale, `es6`, embed, TV) carries the same signature and n code.
+ * Mapping them to the `player_ias` variant the Kotlin runtime and remote configs are verified against lets
+ * every cipher path share one download, and keeps variants the runtime cannot parse from disabling ciphers.
  */
 internal fun canonicalPlayerUrl(playerUrl: String): String =
-    LOCALIZED_IAS_PLAYER_URL.matchEntire(playerUrl)?.let { match ->
-        "https://www.youtube.com/s/player/${match.groupValues[1]}/player_ias.vflset/en_GB/base.js"
-    } ?: playerUrl
+    if (PLAYER_VARIANT_PATH.containsMatchIn(playerUrl)) faradayCipherPlayerUrl(playerUrl) ?: playerUrl else playerUrl

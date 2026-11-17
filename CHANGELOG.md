@@ -6,6 +6,137 @@ that `0.x` releases may contain breaking API changes.
 
 ## [Unreleased]
 
+## [0.11.8] - 2026-11-17
+
+### Fixed
+
+- Every script variant of a player build (`player_es6`, `player_embed_es6`, `tv-player-ias` and
+  others) now resolves to its `player_ias` script for signature and n transforms. QuackJS cannot
+  parse those variants, so embed and TV player URLs left ciphered formats without a URL and web
+  clients fell back to HLS streams the CDN refused.
+
+## [0.11.7] - 2026-11-13
+
+### Fixed
+
+- Audio-only extraction prefers YouTube Music SABR profiles, minting a PO token for
+  them first. A WEB SABR session whose token YouTube kept attestation-pending stopped
+  after about 60 seconds of audio.
+
+## [0.11.6] - 2026-11-07
+
+### Fixed
+
+- iOS cipher work now runs on threads with 16 MB stacks. On the 512 KB GCD worker
+  stacks, QuackJS overflowed and ended the process on a debug build.
+
+## [0.11.5] - 2026-11-06
+
+### Added
+
+- `SabrAudioStream` accepts an optional suspend token supplier. Tokenless audio
+  starts immediately and attaches the result on later requests. It waits up to
+  30 seconds when attestation is pending or before reaching 80 seconds of media. Existing tokenized streams and
+  calls without a supplier retain their behavior. `SabrBootstrap.tokenVisitorData`
+  retains the player visitor for the supplier's token binding.
+- `TVHTML5_SAMSUNG`, a manually selected tokenless TV client for direct audio.
+  YouTube forbids its media until pre-roll ads would end, so extraction waits
+  up to 35 seconds.
+
+### Changed
+
+- `ClientFallbackStrategy.selectClients` now attaches catalog manifests when an
+  implementation overrides only `resolveClients`. Catalog age filters, cipher
+  preparation, token policies, health keys and `manifestId__po` or
+  `manifestId__nopo` profile IDs now apply to those implementations. Legacy
+  profile aliases still work for exclusions.
+- `SabrAudioStream` and `SabrBootstrap` constructors and `SabrBootstrap.copy`,
+  including `copy$default`, changed JVM binary signatures. Consumers compiled
+  against an earlier release must recompile.
+
+### Fixed
+
+- Web Embedded is probe-only after anonymous normal and made-for-kids probes
+  returned `NO_PLAYABLE_STREAM`. It leaves automatic selection and remains
+  only as the last-resort embedded fallback.
+- Android VR 1.65.10 is marked broken after normal audio returned HTTP 403
+  on the second media range. It remains probe-only.
+
+## [0.11.4] - 2026-11-06
+
+### Changed
+
+- Depends on QuackJS 0.1.4, which compiles players about 11% faster with 22%
+  less allocation and rejects constructs it cannot run faithfully.
+- Native video skips the watch-page fetch when visitor data is available and
+  the response needs no cipher work.
+- Cold cipher preparation overlaps token and player requests, and prewarming
+  also warms the public player.
+- Player script downloads have a 15-second stage budget, leaving time for
+  variant and client fallbacks.
+
+### Fixed
+
+- SABR requests keep their retries and typed errors when the host client sets
+  `expectSuccess`, and transport errors no longer expose signed URLs.
+- Authenticated requests reject redirects, and isolated clients have finite
+  timeouts.
+- Cookie-authenticated responses now reject DRM formats.
+- Remote config recovers from unusable cached bodies, and n parameter matching
+  honors query boundaries.
+- Client health ignores removed videos, caller timeouts, and failures from a
+  previous account.
+
+## [0.11.3] - 2026-11-05
+
+### Changed
+
+- Depends on QuackJS 0.1.3, which is about 65x faster on warm `n` transforms,
+  1.5x faster on player compilation and first call, and retains about half the
+  heap per compiled player on the JVM. The cipher API and failure behavior are
+  unchanged.
+
+## [0.11.2] - 2026-10-22
+
+### Changed
+
+- Builds with Kotlin 2.4.21, kotlinx-serialization 1.12.0 and Gradle 9.8.2, and
+  depends on QuackJS 0.1.2.
+
+## [0.11.1] - 2026-10-22
+
+### Fixed
+
+- Players that use `Math.pow` and other Math builtins (for example `55de7e60`)
+  compile again by depending on QuackJS 0.1.1, restoring `WEB_REMIX` and
+  `WEB_REMIX_SABR` deciphering.
+- The cipher service selects the same-hash IAS player variant when the advertised
+  ES6 script cannot be parsed, keeping the exact script as a fallback.
+- Cipher compile warnings include the bounded, URL-redacted failure reason, and
+  cached compile failures are still reported during the cooldown.
+- Deciphering failures are no longer classified as explicit-content restrictions.
+
+## [0.11.0] - 2026-10-21
+
+### Changed
+
+- Player deciphering uses hosted QuackJS 0.1.0, with no QuickJS runtime, JNI cipher
+  loader or bundled EJS scripts. Unsupported players fail closed.
+- Compiled Kotlin players are reused across preload, batch and single operations.
+  Existing EJS prewarm/cache hooks remain binary-compatible no-ops; stored user data
+  is left untouched.
+- Integrates the extraction startup-latency and memory improvements from #28,
+  including bounded request budgets, remote-config refreshes and direct/SABR routing.
+
+### Fixed
+
+- Disposed player downloads cannot refill caches or invalidate newer downloads.
+- Unsupported token providers no longer start unused overlapping token mints.
+- Expired optional deadlines return null without a second-clock-read race.
+- Video-specific unavailability does not penalize unrelated videos' client health.
+- Nonzero SABR opening segments are reordered within a bounded startup window,
+  preserving early streaming, cancellation and sequence-gap checks.
+
 ## [0.10.0] - 2026-10-15
 
 ### Fixed
